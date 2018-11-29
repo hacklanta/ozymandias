@@ -1,0 +1,29 @@
+{
+  "name": "ozymandias",
+  "description": "Handler for GitHub merge-on-green/integration testing functionality",
+  "version": "0.0.1",
+  "author": "Antonio Salazar Cardozo <savedfastcool@gmail.com>",
+  "license": "MIT",
+  "keywords": [
+    "hubot",
+    "merge",
+    "github",
+    "green"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/hacklanta/ozymandias.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hacklanta/ozymandias/issues"
+  },
+  "dependencies": {
+    "typescript": "3.1.6",
+    "axios": "0.18.0",
+    "word-wrap": "1.2.3"
+  },
+  "devDependencies": {
+    "@types/express-serve-static-core": "4.16.0"
+  },
+  "main": "index.ts"
+}
