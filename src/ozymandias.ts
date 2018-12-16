@@ -14,16 +14,37 @@
 // pulled in.
 import { IRouter, Response } from "express-serve-static-core"
 import { default as axios } from "axios"
-import * as wordWrap from "word-wrap"
+import wordWrap from "word-wrap";
 
-// A list of PR numbers that should be monitored for green status and merged
+// MergeAttempt represents a pending attempt to merge a PR. It contains the URL
+// to the PR's API entry, alongside the timestamp for when the merge attempt was
+// initiated.
+type MergeAttempt = {
+    prUrl: string,
+    monitorStartTimestamp: number
+}
+
+// A list of MergeAttempts that should be monitored for green status and merged
 // when they reach it (unless mergeability is not possible).
-const monitoredPRs: number[] = []
+const monitoredAttempts: { [key: string]: MergeAttempt } = {}
 
-async function greenMerge(prNumber: number, prUrl: string) {
-    // fetch PR
-    let response = await axios.get(prUrl)
+const SECONDS = 1000,
+      MINUTES = 60 * SECONDS,
+      MONITOR_TIMEOUT = 60 * MINUTES;
+
+async function greenMerge(attempt: MergeAttempt) {
+    // Fetch PR.
+    let response = await axios.get(attempt.prUrl)
     let pr: PullRequest = response.data
+    let postComment = (comment: string) => {
+        return axios.post(pr.comments_url, { body: comment })
+    }
+
+    // Check if we've outlasted our timeout.
+    let now = (new Date()).getTime()
+    if (now - attempt.monitorStartTimestamp > MONITOR_TIMEOUT) {
+        postComment("Timed out after 60 minutes waiting to merge.")
+    }
 
     let commitBody = 
         wordWrap(
@@ -34,44 +55,80 @@ async function greenMerge(prNumber: number, prUrl: string) {
                     pr.body,
             { width: 72 }
         );
-    
-    if (pr.mergeable == true && pr.mergeable_state == MergeStateStatus.Clean) {
-        try {
-            let mergeResult = await axios.put(
-                `${pr.url}/merge`,
-                { 
-                    commit_title: `Merge pull request #${pr.number} from ${pr.base.repo.full_name}`,
-                    commit_message: commitBody,
-                    sha: pr.head.sha
-                }
-            )
 
-            // Comment success!
-        } catch (error) {
-            // 405 Method not allowed
-            // {
-            //   "message": "Pull Request is not mergeable",
-            //   "documentation_url": "https://developer.github.com/v3/pulls/#merge-a-pull-request-merge-button"
-            // }
-            // 409 Conflict
-            // {
-            //   "message": "Head branch was modified. Review and try the merge again.",
-            //   "documentation_url": "https://developer.github.com/v3/pulls/#merge-a-pull-request-merge-button"
-            // }
+    try {
+        if (pr.mergeable == true && pr.mergeable_state == MergeStateStatus.Clean) {
+            try {
+                // Even if the comment fails, merge.
+                await axios.put(
+                    `${pr.url}/merge`,
+                    { 
+                        commit_title: `Merge pull request #${pr.number} from ${pr.base.repo.full_name}`,
+                        commit_message: commitBody,
+                        sha: pr.head.sha
+                    }
+                )
+            } catch (error) {
+                let response = error.response,
+                    status = response.status,
+                    message = response.data.status,
+                    url = response.data.documentation_url;
+
+                if (status == 409) {
+                    // GitHub's response is descriptive enough; post it directly.
+                    postComment(message)
+                } else if (url) {
+                    postComment(`Unknown error merging PR: [${message}](${url}).`)
+                } else if (message) {
+                    postComment(`Unknown error merging PR: ${message}.`)
+                } else {
+                    postComment(`Unknown error merging PR: ${JSON.stringify(response.data)}.`)
+                }
+            }
+        } else if (pr.mergeable === true && pr.mergeable_state != MergeStateStatus.Clean) {
+            // Hacky-lacky, the PR gives us a statuses URL and we turn it into
+            // the signular status URL that gives us a combined status for the
+            // PR head.
+            let statusResponse = await axios.get(pr.statuses_url.replace(/statuses/, 'status'))
+
+            if (statusResponse.data.state == 'pending') {
+                // Statuses are pending, wait for them to resolve.
+                monitoredAttempts[attempt.prUrl] = attempt;
+            } else if (statusResponse.data.state == 'success') {
+                // Statuses are clean, yet mergeable state isn't; something else
+                // is wrong, signal as much.
+                postComment("Merge is blocked! Resolve the issue, then try again.")
+            } else {
+                // Statuses aren't clean or pending, stop trying to merge.
+                postComment("One or more required status checks failed; aborting merge.")
+            }
+        } else if (pr.mergeable === false) { // null means not yet available
+            postComment("PR is not mergeable! Resolve conflicts, then try again.")
+        } else {
+            // may be missing an edge case, but:
+            monitoredAttempts[attempt.prUrl] = attempt;
         }
-    } else if (pr.mergeable == false) {
-        // comment that the PR isn't mergeable
-    } else if (pr.mergeable_state == MergeStateStatus.Blocked) {
-        // comment that the PR merge is blocked
-    } else 
-        // may be missing an edge case, but:
-        monitoredPRs.push(prNumber)
+    } catch (error) {
+        console.error(`Failed to update PR ${attempt.prUrl}: ${error}`)
     }
 }
 
-function runThenMerge(prNumber: number, job: string) {
-    // fetch PR
-    //
+async function runThenMerge(
+    runJob: (commit: string)=>Promise<any>,
+    attempt: MergeAttempt
+) {
+    let response = await axios.get(attempt.prUrl),
+        pr: PullRequest = response.data;
+
+    // Wait for job running to complete successfully, then schedule the PR merge
+    // attempt.
+    await runJob(pr.head.sha)
+
+    monitoredAttempts[attempt.prUrl] = attempt
+}
+
+// Association between CI provider name and a function that dispatches a request
+// to run a job on that CI provider.
     // Circle CI: POST /project/:vcs-type/:username/:project/build?circle_token=:token
     // {
     //     revision: mergeHeadRevision,
@@ -79,7 +136,6 @@ function runThenMerge(prNumber: number, job: string) {
     //       "CIRCLE_JOB": job
     //     }
     // }
-}
 
 enum AuthorAssociation {
     Collaborator = 'COLLABORATOR',
@@ -163,7 +219,7 @@ type Issue = {
 
     created_at: string,
     updated_at: string,
-    closed_at: string?,
+    closed_at?: string,
     author_association?: AuthorAssociation,
 
     url: string,
@@ -199,20 +255,34 @@ type IssueComment = {
 
     created_at: string,
     updated_at: string,
-    author_association: AuthorAssociation?,
+    author_association?: AuthorAssociation,
 
     url: string,
     html_url: string,
 }
 
-function setUpHooks(robot: any) {
+// setUpHooks sets up the callback hooks on the router that allow GitHub to
+// notify Ozymandias about a new comment. New comments are monitored for "merge
+// on green" and "run <job> and merge". The former triggers Ozymandias to wait
+// for a mergeable pull request and then merge it. The latter requests that a
+// job be run on a CI provider and then waits for a mergeable pull request.
+//
+// Two things worth noting:
+// - The CI provider is abstracted behind the `runJob` function, which takes a
+//   job name and commit SHA and returns a Promise representing the result of
+//   requesting that the job be run. If the Promise is successful, the job
+//   submission is considered successful.
+// - The CI provider is in charge of updating the commit status for the given
+//   job.  Ozymandias only checks the PR and thus commit's status via the status
+//   checks API, so if the provider doesn't update the commit status, Ozymandias
+//   may merge the PR before the cited job finishes running.
+function setUpHooks(router: IRouter, runJob: (repository: string, job: string, commit: string)=>Promise<any>) {
     let greenMergeRegExp = new RegExp("merge on green"),
         runMergeRegExp = new RegExp("run ([^ ]+) and merge");
-    // fetch username
+    // fetch username?
     //   new RegExp(`@${username}.*merge on green.*`)
     //
 
-    let router: IRouter = robot.router
     router.get('/github/pull_request/comment', (req, res) => {
         let comment: IssueComment = req.body.comment,
             issue: Issue = req.body.issue;
@@ -221,13 +291,26 @@ function setUpHooks(robot: any) {
                 comment.author_association == AuthorAssociation.Collaborator) {
             let match: RegExpMatchArray | null = null
             if (comment.body.match(greenMergeRegExp)) {
-                greenMerge(issue.number, issue.url)
-
                 res.status(200)
                     .send('Triggering merge on green.')
+
+                greenMerge({
+                    prUrl: issue.url,
+                    monitorStartTimestamp: (new Date()).getTime()
+                })
             } else if (match = comment.body.match(runMergeRegExp)) {
-                let job = match[1]
-                runThenMerge(issue.number, job)
+                let job = match[1],
+                    // Hack attack, but let's not do an extra request to the
+                    // repo root, which we'd have to construct ourselves anyway,
+                    // to get the full repo name.
+                    repoName = issue.repository_url.replace(/^.*repos\//, "");
+                runThenMerge(
+                    (commit: string) => runJob(repoName, job, commit),
+                    {
+                        prUrl: issue.url,
+                        monitorStartTimestamp: (new Date()).getTime()
+                    }
+                )
 
                 res.status(200)
                     .send(`Attempting to trigger job [${job}] then merge on green.`)
@@ -236,10 +319,10 @@ function setUpHooks(robot: any) {
                     .send('No action detected.')
             }
         } else {
-            res.status(200)
+            res.status(400)
                 .send('Author not authorized to trigger an action.')
         }
     })
 }
 
-exports = setUpHooks
+export default { setUpHooks };
